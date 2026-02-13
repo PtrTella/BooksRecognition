@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.cluster.hierarchy import fclusterdata
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +76,7 @@ class Config:
     max_area_frac:   float = 0.9
 
     # NMS
-    iou_same:  float = 0.40
+    iou_same:  float = 0.50  # Permette detection più vicine per stesso modello
     iou_cross: float = 0.50
 
 
@@ -91,6 +92,9 @@ class Preprocessor:
          enhancement that reveals detail in dark / bright regions.
       2. Unsharp mask -- gentle sharpening to boost gradient
          responses for SIFT, especially on thin book spines.
+    
+    NOTE: Bilateral filter and morphological operations were tested
+    but reduced keypoints by 30%, hurting recall.
     """
 
     def __init__(self, cfg: Config) -> None:
@@ -287,8 +291,7 @@ class StarModel:
         tpl: dict,
         scene_shape: Tuple[int, ...],
     ) -> List[list]:
-        """Cast centre votes and return merged peaks."""
-        bs = self.cfg.bin_size
+        """Cast centre votes and cluster spatially for multi-instance detection."""
         vecs = tpl["vecs"]
 
         qidx = [m.queryIdx for m in matches]
@@ -306,35 +309,28 @@ class StarModel:
 
         valid = ((votes[:, 0] >= 0) & (votes[:, 0] < scene_shape[1]) &
                  (votes[:, 1] >= 0) & (votes[:, 1] < scene_shape[0]))
-        bins: Dict[Tuple[int, int], list] = defaultdict(list)
-        for i in np.flatnonzero(valid):
-            bx = int(votes[i, 0] // bs)
-            by = int(votes[i, 1] // bs)
-            bins[(bx, by)].append(matches[i])
-
-        return self._merge(bins)
-
-    def _merge(self, bins: Dict[Tuple[int, int], list]) -> List[list]:
-        """Greedy merge of neighbouring bins into peaks."""
-        r = self.cfg.merge_radius
-        keys = sorted(bins, key=lambda b: len(bins[b]), reverse=True)
-        used: set = set()
-        groups: List[list] = []
-        for b in keys:
-            if b in used:
-                continue
-            g = list(bins[b])
-            used.add(b)
-            for dx in range(-r, r + 1):
-                for dy in range(-r, r + 1):
-                    nb = (b[0] + dx, b[1] + dy)
-                    if nb != b and nb not in used and nb in bins:
-                        g.extend(bins[nb])
-                        used.add(nb)
-            if len(g) >= self.cfg.min_votes:
-                groups.append(g)
-        groups.sort(key=len, reverse=True)
-        return groups
+        
+        valid_votes = votes[valid]
+        valid_matches = [matches[i] for i in np.flatnonzero(valid)]
+        
+        if len(valid_votes) < self.cfg.min_votes:
+            return []
+        
+        # Use hierarchical clustering instead of rigid binning
+        # This better separates adjacent identical books
+        cluster_dist = self.cfg.bin_size * 2
+        clusters = fclusterdata(valid_votes, t=cluster_dist, criterion='distance', method='single')
+        
+        # Group matches by cluster
+        groups: Dict[int, list] = defaultdict(list)
+        for i, c in enumerate(clusters):
+            groups[c].append(valid_matches[i])
+        
+        # Filter by min_votes and sort by size
+        peaks = [g for g in groups.values() if len(g) >= self.cfg.min_votes]
+        peaks.sort(key=len, reverse=True)
+        
+        return peaks
 
     # -- instance extraction (peeling) -----------------------------------------
 
@@ -440,6 +436,12 @@ class StarModel:
         # overfitting with few points) vs partial-affine (4 DOF, robust)
         min_inl = self.cfg.min_inliers if use_affine else self.cfg.min_inliers_h
         if n_inliers < min_inl:
+            return None
+        
+        # Adaptive score threshold based on model complexity
+        model_kp_count = len(tpl["kp"])
+        score_threshold = max(3, int(model_kp_count * 0.005))  # 0.5% of model keypoints
+        if n_inliers < score_threshold:
             return None
 
         # Determinant sanity (reject flips / extreme warps)
@@ -610,15 +612,19 @@ class BookRecognizer:
                 cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th, cv2.LINE_AA,
             )
 
+        # Save to file AND show
+        import os
+        os.makedirs("output", exist_ok=True)
+        out_path = os.path.join("output", f"result_{name}")
+        cv2.imwrite(out_path, vis)
+        
         plt.figure(figsize=(14, 8))
         plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
-        plt.title(
-            f"{name} -- {len(results)} book(s): {', '.join(ids)}",
-            fontsize=10,
-        )
+        plt.title(f"{name} -- {len(results)} book(s): {ids}")
         plt.axis("off")
         plt.tight_layout()
         plt.show()
+        
         for r in results:
             print(f"  -> {r['book_id']} ({r['score']} inliers)")
 

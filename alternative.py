@@ -38,39 +38,47 @@ class Config:
     """All tuneable parameters in one place."""
 
     # -- Preprocessing (CLAHE + unsharp mask on LAB L-channel) --
-    clahe_clip:         float = 2.5
+    clahe_clip:         float = 3.0      # Più aggressivo per testo su spine
     clahe_grid:         int   = 8
-    sharpen_amount:     float = 0.8
+    sharpen_amount:     float = 1.0      # Più sharpening
 
-    # -- SIFT --
+    # -- SIFT -- più sensibile per più keypoints
     nfeatures:          int   = 0
-    contrast_threshold: float = 0.03
-    edge_threshold:     float = 10
-    n_octave_layers:    int   = 3
+    contrast_threshold: float = 0.01     # Più basso = più keypoints
+    edge_threshold:     float = 15       # Più alto = meno edge rejection
+    n_octave_layers:    int   = 4        # Più layers = più scale
     root_sift:          bool  = True
 
     # -- FLANN matching --
-    lowe_ratio:    float = 0.78
+    lowe_ratio:    float = 0.78          # Stretto per meno FP
     flann_trees:   int   = 5
     flann_checks:  int   = 100
-    scale_sigma:   float = 2.5     # MAD outlier rejection
+    scale_sigma:   float = 3.5           # Più tollerante su scale differences
 
     # -- DBSCAN clustering --
     dbscan_eps:      float = 20.0  # neighbourhood radius (px)
     dbscan_min_pts:  int   = 3     # core-point threshold
 
     # -- Geometric verification --
-    ransac_thresh:   float = 5.0
-    min_inliers:     int   = 5
-    min_det:         float = 0.02  # determinant lower bound
-    max_det:         float = 50.0  # determinant upper bound
-    min_area:        int   = 500
+    ransac_thresh:   float = 4.0         # Leggermente più stretto
+    min_inliers:     int   = 3           # Abbassato per spine sottili
+    min_det:         float = 0.025       # determinant lower bound
+    max_det:         float = 40.0        # determinant upper bound
+    min_area:        int   = 450
     max_area_frac:   float = 0.9
     ar_tolerance:    float = 3.0   # aspect-ratio tolerance factor
 
     # -- NMS --
-    iou_same:  float = 0.40
-    iou_cross: float = 0.50
+    iou_same:  float = 0.30
+    iou_cross: float = 0.35
+
+    # -- Edge density verification (post-filter) --
+    edge_verify:    bool  = True   # Enable edge density verification
+    edge_tolerance: float = 2.6    # Tolerance factor for edge density check
+
+    # -- NCC warp-and-compare verification --
+    ncc_verify:     bool  = True
+    ncc_threshold:  float = 0.20   # Reject detections with NCC below this
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -190,14 +198,24 @@ class FeatureMatcher:
             if mkp is None:
                 filtered[bid] = ms
                 continue
-            ratios = np.array([
-                kp_scene[m.queryIdx].size / mkp[m.trainIdx].size
-                for m in ms
-            ])
+            
+            # Safely compute scale ratios (handles rotation augmentation)
+            valid_ms = []
+            ratios = []
+            for m in ms:
+                if m.trainIdx < len(mkp):
+                    valid_ms.append(m)
+                    ratios.append(kp_scene[m.queryIdx].size / mkp[m.trainIdx].size)
+            
+            if len(valid_ms) < 3:
+                filtered[bid] = ms  # Not enough for MAD, keep all
+                continue
+            
+            ratios = np.array(ratios)
             med = np.median(ratios)
             mad = np.median(np.abs(ratios - med)) + 1e-7
             keep = np.abs(ratios - med) <= sigma * mad
-            filtered[bid] = [m for m, k in zip(ms, keep) if k]
+            filtered[bid] = [m for m, k in zip(valid_ms, keep) if k]
 
         return filtered
 
@@ -275,24 +293,27 @@ class StarVoter:
 # ═══════════════════════════════════════════════════════════════════════════
 
 class Clusterer:
-    """Density-based spatial clustering of 2-D centre votes.
+    """DBSCAN spatial clustering of 2-D centre votes.
 
     Returns a dict mapping cluster label → list of match indices.
     Noise points (label == -1) are discarded.
     """
 
     def __init__(self, cfg: Config) -> None:
-        self._eps = cfg.dbscan_eps
-        self._min_pts = cfg.dbscan_min_pts
+        self._cfg = cfg
 
     def __call__(self, centres: np.ndarray) -> Dict[int, List[int]]:
+        if len(centres) < 2:
+            return {0: list(range(len(centres)))} if len(centres) else {}
+
         db = DBSCAN(
-            eps=self._eps,
-            min_samples=self._min_pts,
-        ).fit(centres)
+            eps=self._cfg.dbscan_eps,
+            min_samples=self._cfg.dbscan_min_pts,
+        )
+        labels = db.fit_predict(centres)
 
         clusters: Dict[int, List[int]] = defaultdict(list)
-        for i, label in enumerate(db.labels_):
+        for i, label in enumerate(labels):
             if label >= 0:
                 clusters[label].append(i)
         return clusters
@@ -417,6 +438,110 @@ class GeometricVerifier:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Edge Density Verification
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EdgeDensityVerifier:
+    """Verify detections by comparing edge density between model and scene ROI.
+    
+    Rejects detections where the edge density ratio differs too much,
+    which helps filter false positives from texture-poor regions.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._templates: Dict[str, float] = {}
+
+    def register(self, bid: str, enhanced: np.ndarray) -> None:
+        """Store edge density for a model image."""
+        edges = cv2.Canny(enhanced, 50, 150)
+        self._templates[bid] = np.mean(edges > 0)
+
+    def verify(self, det: dict, scene_enhanced: np.ndarray) -> bool:
+        """Return True if detection passes edge density check."""
+        bid = det["book_id"]
+        if bid not in self._templates:
+            return True  # No template, skip verification
+        
+        # Extract scene ROI and compute edge density
+        mask = np.zeros(scene_enhanced.shape[:2], dtype=np.uint8)
+        cv2.fillConvexPoly(mask, det["bbox"].astype(np.int32), 255)
+        scene_edges = cv2.Canny(scene_enhanced, 50, 150)
+        
+        roi_pixels = np.sum(mask > 0)
+        if roi_pixels == 0:
+            return True
+        
+        scene_density = np.sum((scene_edges > 0) & (mask > 0)) / roi_pixels
+        model_density = self._templates[bid]
+        
+        if model_density < 1e-6:
+            return True  # Avoid division by zero
+        
+        ratio = scene_density / model_density
+        tol = self._cfg.edge_tolerance
+        return (1.0 / tol) <= ratio <= tol
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  NCC Warp-and-Compare Verification
+# ═══════════════════════════════════════════════════════════════════════════
+
+class NCCVerifier:
+    """Warp model into scene space and compute Normalised Cross Correlation.
+
+    Catches false positives: when SIFT finds a consistent affine transform
+    but the warped model's pixel content doesn't actually match the scene
+    region, the detection is likely spurious.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._model_images: Dict[str, np.ndarray] = {}
+
+    def register(self, bid: str, enhanced: np.ndarray) -> None:
+        self._model_images[bid] = enhanced
+
+    def verify(self, det: dict, scene_enhanced: np.ndarray) -> bool:
+        bid = det["book_id"]
+        model_img = self._model_images.get(bid)
+        if model_img is None:
+            return True
+        H = det["H"]
+        h_s, w_s = scene_enhanced.shape[:2]
+
+        if H.shape[0] == 2:
+            warped = cv2.warpAffine(model_img, H, (w_s, h_s),
+                                    flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            mask = cv2.warpAffine(np.ones_like(model_img) * 255, H, (w_s, h_s),
+                                  flags=cv2.INTER_NEAREST,
+                                  borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        else:
+            warped = cv2.warpPerspective(model_img, H, (w_s, h_s),
+                                         flags=cv2.INTER_LINEAR,
+                                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+            mask = cv2.warpPerspective(np.ones_like(model_img) * 255, H, (w_s, h_s),
+                                       flags=cv2.INTER_NEAREST,
+                                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+        valid = mask > 128
+        if valid.sum() < 100:
+            return True
+
+        w_pix = warped[valid].astype(np.float64)
+        s_pix = scene_enhanced[valid].astype(np.float64)
+        w_pix -= w_pix.mean()
+        s_pix -= s_pix.mean()
+        w_std = w_pix.std()
+        s_std = s_pix.std()
+        if w_std < 1e-8 or s_std < 1e-8:
+            return False
+        ncc = np.dot(w_pix, s_pix) / (w_std * s_std * len(w_pix))
+        return ncc >= self._cfg.ncc_threshold
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Non-Maximum Suppression
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -523,18 +648,21 @@ class BookRecognizer:
 
     def __init__(self, cfg: Optional[Config] = None) -> None:
         self.cfg = cfg or Config()
-        self.prep      = Preprocessor(self.cfg)
-        self.extractor = FeatureExtractor(self.cfg)
-        self.matcher   = FeatureMatcher(self.cfg)
-        self.voter     = StarVoter()
-        self.clusterer = Clusterer(self.cfg)
-        self.verifier  = GeometricVerifier(self.cfg)
-        self.viz       = Visualizer()
+        self.prep         = Preprocessor(self.cfg)
+        self.extractor    = FeatureExtractor(self.cfg)
+        self.matcher      = FeatureMatcher(self.cfg)
+        self.voter        = StarVoter()
+        self.clusterer    = Clusterer(self.cfg)
+        self.verifier     = GeometricVerifier(self.cfg)
+        self.edge_verify  = EdgeDensityVerifier(self.cfg) if self.cfg.edge_verify else None
+        self.ncc_verify   = NCCVerifier(self.cfg) if self.cfg.ncc_verify else None
+        self.viz          = Visualizer()
 
     def load_library(self, path: str) -> None:
         """Index all model images in *path*."""
         print(f"Indexing models from {path} ...")
         n = 0
+        
         for f in sorted(os.listdir(path)):
             if not f.lower().endswith((".png", ".jpg", ".jpeg")):
                 continue
@@ -542,14 +670,21 @@ class BookRecognizer:
             if img is None:
                 continue
             bid = os.path.splitext(f)[0]
+            
             enhanced = self.prep(img)
             kp, des = self.extractor(enhanced)
             if des is None:
                 continue
+            
             self.voter.register(bid, kp, enhanced.shape)
             self.matcher.add(bid, des)
+            if self.edge_verify:
+                self.edge_verify.register(bid, enhanced)
+            if self.ncc_verify:
+                self.ncc_verify.register(bid, enhanced)
             n += 1
             print(f"  {bid}: {len(kp)} keypoints")
+        
         self.matcher.build()
         print(f"{n} models indexed.\n")
 
@@ -604,9 +739,95 @@ class BookRecognizer:
             enhanced = self.prep(img)
             kp, des = self.extractor(enhanced)
             results = self.detect(kp, des, enhanced.shape)
+            
+            # Edge density post-verification filter
+            if self.edge_verify:
+                results = [r for r in results if self.edge_verify.verify(r, enhanced)]
+
+            # NCC warp-and-compare verification
+            if self.ncc_verify:
+                results = [r for r in results if self.ncc_verify.verify(r, enhanced)]
+
             self.viz.draw(img, results, f)
             total += len(results)
         print(f"\nTotal: {total} books detected across {len(files)} scenes")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Ground Truth & Evaluation
+# ═══════════════════════════════════════════════════════════════════════════
+
+GROUND_TRUTH = {
+    "scene_0": [],
+    "scene_1": ["model_18", "model_18"],
+    "scene_10": ["model_19", "model_19", "model_19", "model_19"],
+    "scene_11": [],
+    "scene_12": [],
+    "scene_13": [],
+    "scene_14": [],
+    "scene_15": ["model_11", "model_11", "model_12", "model_12", "model_12"],
+    "scene_16": ["model_11", "model_11", "model_12", "model_12", "model_12"],
+    "scene_17": ["model_11", "model_11", "model_12", "model_12", "model_12"],
+    "scene_18": ["model_10", "model_10", "model_10", "model_8", "model_8", "model_9"],
+    "scene_19": ["model_6", "model_6", "model_6", "model_7", "model_7"],
+    "scene_2": ["model_17"],
+    "scene_20": [],
+    "scene_21": [],
+    "scene_22": [],
+    "scene_23": ["model_5"],
+    "scene_24": [],
+    "scene_25": [],
+    "scene_26": ["model_0", "model_0", "model_4"],
+    "scene_27": ["model_2", "model_2", "model_3", "model_3"],
+    "scene_28": ["model_1", "model_1"],
+    "scene_3": ["model_16", "model_16"],
+    "scene_4": ["model_14", "model_14", "model_15", "model_15"],
+    "scene_5": ["model_13"],
+    "scene_6": ["model_21"],
+    "scene_7": ["model_20", "model_20"],
+    "scene_8": [],
+    "scene_9": ["model_19", "model_19", "model_19", "model_19"],
+}
+
+
+def evaluate_results(all_results: Dict[str, List[dict]]) -> Dict[str, float]:
+    total_tp = total_fp = total_fn = 0
+    print(f"\n{'='*70}")
+    print("EVALUATION vs GROUND TRUTH")
+    print(f"{'='*70}")
+
+    for scene_name, results in sorted(all_results.items()):
+        scene_key = scene_name.replace(".jpg", "").replace(".png", "")
+        gt = GROUND_TRUTH.get(scene_key, [])
+        detected = [r["book_id"] for r in results]
+        gt_rem = list(gt)
+        tp = 0
+        for d in detected:
+            if d in gt_rem:
+                tp += 1
+                gt_rem.remove(d)
+        fp = len(detected) - tp
+        fn = len(gt) - tp
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+        if gt or detected:
+            s = "✓" if fp == 0 and fn == 0 else "✗"
+            print(f"  {s} {scene_key}: GT={len(gt)}, Det={len(detected)}, TP={tp}, FP={fp}, FN={fn}")
+            if fp > 0 or fn > 0:
+                print(f"      GT: {gt}")
+                print(f"      Detected: {detected}")
+
+    prec = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
+    rec = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0
+    print(f"\n{'='*70}")
+    print(f"TOTAL: TP={total_tp}, FP={total_fp}, FN={total_fn}")
+    print(f"Precision: {prec:.3f}")
+    print(f"Recall:    {rec:.3f}")
+    print(f"F1 Score:  {f1:.3f}")
+    print(f"{'='*70}")
+    return {"precision": prec, "recall": rec, "f1": f1}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -616,4 +837,31 @@ class BookRecognizer:
 if __name__ == "__main__":
     rec = BookRecognizer()
     rec.load_library("./dataset/models/")
-    rec.run("./dataset/scenes/")
+
+    # Run with evaluation
+    files = sorted(
+        f for f in os.listdir("./dataset/scenes/")
+        if f.lower().endswith((".png", ".jpg", ".jpeg"))
+    )
+    print(f"Processing {len(files)} scenes ...")
+    all_results: Dict[str, List[dict]] = {}
+    total = 0
+    for f in files:
+        img = cv2.imread(os.path.join("./dataset/scenes/", f))
+        if img is None:
+            continue
+        enhanced = rec.prep(img)
+        kp, des = rec.extractor(enhanced)
+        results = rec.detect(kp, des, enhanced.shape)
+
+        # Post-verification filters
+        if rec.edge_verify:
+            results = [r for r in results if rec.edge_verify.verify(r, enhanced)]
+        if rec.ncc_verify:
+            results = [r for r in results if rec.ncc_verify.verify(r, enhanced)]
+
+        all_results[f] = results
+        total += len(results)
+
+    print(f"\nTotal: {total} books detected across {len(files)} scenes")
+    evaluate_results(all_results)
