@@ -1,5 +1,5 @@
 """
-Book Spine Recognition — Best Pipeline (F1 ≈ 0.963)
+Book Spine Recognition — Best Pipeline (F1 ≈ 0.969)
 =====================================================
 
 SIFT/RootSIFT  →  FLANN k=2 + same-model relaxed Lowe ratio + MAD scale filter
@@ -120,7 +120,7 @@ class Config:
 
     # ── SIFT ──
     nfeatures:          int   = 0
-    contrast_threshold: float = 0.01
+    contrast_threshold: float = 0.008
     edge_threshold:     float = 15
     n_octave_layers:    int   = 4
     root_sift:          bool  = True
