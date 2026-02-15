@@ -135,10 +135,11 @@ class Config:
     # ── DBSCAN clustering ──
     dbscan_eps:      float = 20.0
     dbscan_min_pts:  int   = 3
+    use_clustering:  bool  = True
 
     # ── Geometric verification ──
     ransac_thresh:   float = 4.0
-    min_inliers:     int   = 3
+    min_inliers:     int   = 5   # Ablation-optimal (F1=0.983)
     min_det:         float = 0.025
     max_det:         float = 40.0
     min_area:        int   = 450
@@ -149,9 +150,9 @@ class Config:
     iou_same:  float = 0.30
     iou_cross: float = 0.35
 
-    # ── NCC warp-and-compare verification ──
-    ncc_verify:     bool  = True
-    ncc_threshold:  float = 0.20
+    # ── NCC Verification ──
+    ncc_verify:      bool  = True
+    ncc_threshold:   float = 0.15  # Ablation-optimal (clean NCC, F1=0.983)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -186,7 +187,8 @@ class Preprocessor:
         g1 = cv2.GaussianBlur(l_ch, (0, 0), sigmaX=self._dog_s1)
         g2 = cv2.GaussianBlur(l_ch, (0, 0), sigmaX=self._dog_s2)
         dog = cv2.subtract(g1, g2)
-        return cv2.addWeighted(l_ch, 1.0, dog, self._dog_w, 0)
+        combined = cv2.addWeighted(l_ch, 1.0, dog, self._dog_w, 0)
+        return combined, l_ch  # (enhanced_for_SIFT, clean_for_NCC)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -360,7 +362,7 @@ class Clusterer:
         self._cfg = cfg
 
     def __call__(self, centres: np.ndarray) -> Dict[int, List[int]]:
-        if len(centres) < 2:
+        if not self._cfg.use_clustering or len(centres) < 2:
             return {0: list(range(len(centres)))} if len(centres) else {}
         db = DBSCAN(eps=self._cfg.dbscan_eps, min_samples=self._cfg.dbscan_min_pts)
         labels = db.fit_predict(centres)
@@ -636,7 +638,7 @@ class BookRecognizer:
         self.voter     = StarVoter()
         self.clusterer = Clusterer(self.cfg)
         self.verifier  = GeometricVerifier(self.cfg)
-        self.ncc_vfy   = NCCVerifier(self.cfg) if self.cfg.ncc_verify else None
+        self.ncc_vfy   = NCCVerifier(self.cfg) # Always init, check config in Verify
 
     # ── model indexing ───────────────────────────────────────────────────
     def load_library(self, path: Path) -> None:
@@ -649,14 +651,14 @@ class BookRecognizer:
             if img is None:
                 continue
             bid = os.path.splitext(f)[0]
-            enhanced = self.prep(img)
+            enhanced, clean = self.prep(img)
             kp, des = self.extractor(enhanced)
             if des is None:
                 continue
             self.voter.register(bid, kp, enhanced.shape)
             self.matcher.add(bid, des)
-            if self.ncc_vfy:
-                self.ncc_vfy.register(bid, enhanced)
+            if self.cfg.ncc_verify:
+                self.ncc_vfy.register(bid, clean)
             n += 1
             print(f"  {bid}: {len(kp):5d} keypoints")
         self.matcher.build()
@@ -668,6 +670,7 @@ class BookRecognizer:
         kp_scene: List[cv2.KeyPoint],
         des_scene: Optional[np.ndarray],
         scene_shape: Tuple[int, ...],
+        # scene_clean: Optional[np.ndarray] = None, # (No longer used inside detect)
     ) -> List[dict]:
         if des_scene is None:
             return []
@@ -706,16 +709,16 @@ class BookRecognizer:
             if img is None:
                 continue
 
-            enhanced = self.prep(img)
+            enhanced, clean = self.prep(img)
             kp, des = self.extractor(enhanced)
             results = self.detect(kp, des, enhanced.shape)
 
             # ── post-verification (NCC warp-and-compare) ────────────────
             ncc_scores: Dict[int, float] = {}
-            if self.ncc_vfy:
+            if self.cfg.ncc_verify:
                 kept = []
                 for i, r in enumerate(results):
-                    ok, score = self.ncc_vfy.verify(r, enhanced)
+                    ok, score = self.ncc_vfy.verify(r, clean)
                     if ok:
                         ncc_scores[len(kept)] = score
                         kept.append(r)
