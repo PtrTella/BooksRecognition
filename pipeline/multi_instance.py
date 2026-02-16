@@ -140,19 +140,13 @@ class Config:
     # ── Geometric verification ──
     ransac_thresh:   float = 4.0
     min_inliers:     int   = 5   # Ablation-optimal (F1=0.983)
-    min_det:         float = 0.025
-    max_det:         float = 40.0
-    min_area:        int   = 450
-    max_area_frac:   float = 0.9
-    ar_tolerance:    float = 3.0
 
     # ── NMS ──
     iou_same:  float = 0.30
     iou_cross: float = 0.35
 
     # ── NCC Verification ──
-    ncc_verify:      bool  = True
-    ncc_threshold:   float = 0.15  # Ablation-optimal (clean NCC, F1=0.983)
+    ncc_threshold:   float = 0.12  # Ablation-optimal (clean NCC, F1=0.983)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -177,18 +171,28 @@ class Preprocessor:
         self._dog_s2     = cfg.dog_sigma2
         self._dog_w      = cfg.dog_weight
 
-    def __call__(self, bgr: np.ndarray) -> np.ndarray:
+    def __call__(self, bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        l_ch     = self._clahe_lab(bgr)
+        sharpened = self._unsharp_mask(l_ch)
+        enhanced  = self._dog_bandpass(sharpened)
+        return enhanced, sharpened   # (enhanced_for_SIFT, clean_for_NCC)
+
+    def _clahe_lab(self, bgr: np.ndarray) -> np.ndarray:
+        """Convert to CIE-LAB and apply CLAHE on the L-channel."""
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
-        l_ch = self._clahe.apply(lab[:, :, 0])
-        # Unsharp mask — boost mid-frequency contrast
-        blur = cv2.GaussianBlur(l_ch, (0, 0), sigmaX=self._usm_sigma)
-        l_ch = cv2.addWeighted(l_ch, 1.0 + self._usm_amount, blur, -self._usm_amount, 0)
-        # Difference-of-Gaussians — enhance fine detail
-        g1 = cv2.GaussianBlur(l_ch, (0, 0), sigmaX=self._dog_s1)
-        g2 = cv2.GaussianBlur(l_ch, (0, 0), sigmaX=self._dog_s2)
+        return self._clahe.apply(lab[:, :, 0])
+
+    def _unsharp_mask(self, gray: np.ndarray) -> np.ndarray:
+        """Boost mid-frequency contrast via unsharp masking."""
+        blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=self._usm_sigma)
+        return cv2.addWeighted(gray, 1.0 + self._usm_amount, blur, -self._usm_amount, 0)
+
+    def _dog_bandpass(self, gray: np.ndarray) -> np.ndarray:
+        """Enhance fine structures via Difference-of-Gaussians."""
+        g1 = cv2.GaussianBlur(gray, (0, 0), sigmaX=self._dog_s1)
+        g2 = cv2.GaussianBlur(gray, (0, 0), sigmaX=self._dog_s2)
         dog = cv2.subtract(g1, g2)
-        combined = cv2.addWeighted(l_ch, 1.0, dog, self._dog_w, 0)
-        return combined, l_ch  # (enhanced_for_SIFT, clean_for_NCC)
+        return cv2.addWeighted(gray, 1.0, dog, self._dog_w, 0)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -255,9 +259,12 @@ class FeatureMatcher:
     ) -> Dict[str, list]:
         if des_scene is None or not self._ids:
             return {}
+        groups = self._ratio_test(des_scene)
+        return self._scale_filter(groups, kp_scene, model_kps)
 
+    def _ratio_test(self, des_scene: np.ndarray) -> Dict[str, list]:
+        """Lowe ratio test with same-model relaxation."""
         raw = self._matcher.knnMatch(des_scene, k=2)
-
         groups: Dict[str, list] = defaultdict(list)
         ratio = self._cfg.lowe_ratio
         same_ratio = self._cfg.same_model_ratio
@@ -267,21 +274,24 @@ class FeatureMatcher:
             m, n = pair
             m_bid = self._ids[m.imgIdx]
             n_bid = self._ids[n.imgIdx]
-            # Standard ratio test vs different-model 2nd-best
             if m.distance < ratio * n.distance:
                 groups[m_bid].append(m)
-            # Relaxed ratio when 2nd-best is from the same model
             elif m_bid == n_bid and m.distance < same_ratio * n.distance:
                 groups[m_bid].append(m)
+        return groups
 
+    def _scale_filter(
+        self,
+        groups: Dict[str, list],
+        kp_scene: List[cv2.KeyPoint],
+        model_kps: Dict[str, List[cv2.KeyPoint]],
+    ) -> Dict[str, list]:
+        """MAD-based scale-ratio consistency filter."""
         sigma = self._cfg.scale_sigma
         filtered: Dict[str, list] = {}
         for bid, ms in groups.items():
-            if len(ms) < 3:
-                filtered[bid] = ms
-                continue
             mkp = model_kps.get(bid)
-            if mkp is None:
+            if len(ms) < 3 or mkp is None:
                 filtered[bid] = ms
                 continue
 
@@ -308,10 +318,12 @@ class FeatureMatcher:
 #  Star-Model Voter (GHT centre-vote projection)
 # ══════════════════════════════════════════════════════════════════════════
 class StarVoter:
-    """Stores displacement vectors (keypoint → model centre) and projects
-    matched scene keypoints to centre-vote locations."""
+    """Generalised Hough voting:  stores displacement vectors
+    (keypoint → model centre), projects matched scene keypoints to
+    centre-vote locations, and clusters them with DBSCAN."""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
         self._templates: Dict[str, dict] = {}
 
     @property
@@ -335,7 +347,24 @@ class StarVoter:
 
         self._templates[bid] = {"kp": kp, "vecs": vecs, "shape": shape}
 
-    def project(self, matches: list, kp_scene: List[cv2.KeyPoint], tpl: dict) -> np.ndarray:
+    def vote(self, matches: list, kp_scene: List[cv2.KeyPoint],
+             tpl: dict) -> Dict[int, List[int]]:
+        """Project matches to centre votes and cluster with DBSCAN.
+        Returns  {cluster_id: [match_indices]}."""
+        centres = self._project(matches, kp_scene, tpl)
+        if not self._cfg.use_clustering or len(centres) < 2:
+            return {0: list(range(len(centres)))} if len(centres) else {}
+        db = DBSCAN(eps=self._cfg.dbscan_eps, min_samples=self._cfg.dbscan_min_pts)
+        labels = db.fit_predict(centres)
+        clusters: Dict[int, List[int]] = defaultdict(list)
+        for i, label in enumerate(labels):
+            if label >= 0:
+                clusters[label].append(i)
+        return clusters
+
+    # ── internal ─────────────────────────────────────────────────────────
+    def _project(self, matches: list, kp_scene: List[cv2.KeyPoint],
+                 tpl: dict) -> np.ndarray:
         vecs = tpl["vecs"]
         qidx = [m.queryIdx for m in matches]
         tidx = [m.trainIdx for m in matches]
@@ -353,59 +382,46 @@ class StarVoter:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  DBSCAN Clusterer
+#  Verifier  (RANSAC affine  +  NCC acceptance)
 # ══════════════════════════════════════════════════════════════════════════
-class Clusterer:
-    """DBSCAN spatial grouping of 2-D centre votes.  Noise (label -1) discarded."""
+class Verifier:
+    """Unified verification: RANSAC estimates the affine transform,
+    NCC warp-and-compare is the sole acceptance gate.
 
-    def __init__(self, cfg: Config) -> None:
-        self._cfg = cfg
-
-    def __call__(self, centres: np.ndarray) -> Dict[int, List[int]]:
-        if not self._cfg.use_clustering or len(centres) < 2:
-            return {0: list(range(len(centres)))} if len(centres) else {}
-        db = DBSCAN(eps=self._cfg.dbscan_eps, min_samples=self._cfg.dbscan_min_pts)
-        labels = db.fit_predict(centres)
-        clusters: Dict[int, List[int]] = defaultdict(list)
-        for i, label in enumerate(labels):
-            if label >= 0:
-                clusters[label].append(i)
-        return clusters
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Geometric Verifier (affine peeling)
-# ══════════════════════════════════════════════════════════════════════════
-class GeometricVerifier:
-    """Partial-affine (similarity, 4-DOF) fitting with iterative peeling.
-
-    Validates: inlier count, determinant, convexity, aspect ratio, area.
-    Strips inliers and repeats to find multiple instances in one cluster.
+    Iterative peeling strips inliers after each accepted detection so
+    that multiple instances of the same model can be found in one cluster.
     """
 
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
+        self._models: Dict[str, np.ndarray] = {}   # bid → enhanced image
 
+    def register(self, bid: str, enhanced: np.ndarray) -> None:
+        """Register a model's pre-processed image for NCC comparison."""
+        self._models[bid] = enhanced
+
+    # ── public entry point ───────────────────────────────────────────────
     def peel(
         self,
         bid: str,
         matches: list,
         tpl: dict,
         kp_scene: List[cv2.KeyPoint],
-        scene_shape: Tuple[int, ...],
+        scene_enhanced: np.ndarray,
     ) -> List[dict]:
+        """Find all valid instances in *matches* via RANSAC + NCC peeling."""
         found: List[dict] = []
         pool = list(matches)
         while len(pool) >= self._cfg.min_inliers:
-            result = self._fit(bid, pool, tpl, kp_scene, scene_shape)
+            result = self._fit(bid, pool, tpl, kp_scene, scene_enhanced)
             if result is None:
                 break
             found.append(result)
             pool = self._strip(pool, tpl, kp_scene, result["H"])
         return found
 
-    # ── private ──────────────────────────────────────────────────────────
-    def _fit(self, bid, matches, tpl, kp_scene, scene_shape):
+    # ── RANSAC fit + NCC gate ────────────────────────────────────────────
+    def _fit(self, bid, matches, tpl, kp_scene, scene_enhanced):
         src = np.float32([tpl["kp"][m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
         dst = np.float32([kp_scene[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
 
@@ -419,80 +435,36 @@ class GeometricVerifier:
         if n_inliers < self._cfg.min_inliers:
             return None
 
-        det = np.linalg.det(H[:2, :2])
-        if det < self._cfg.min_det or det > self._cfg.max_det:
-            return None
-
+        # Bounding box from warped model corners
         h, w = tpl["shape"][:2]
         corners = np.float32([[0, 0], [w, 0], [w, h], [0, h]]).reshape(-1, 1, 2)
         bbox = cv2.transform(corners, H)
-        if not cv2.isContourConvex(bbox.astype(np.int32)):
+
+        # NCC acceptance gate
+        ncc = self._ncc(bid, H, scene_enhanced)
+        if ncc < self._cfg.ncc_threshold:
             return None
 
-        pts4 = bbox.reshape(4, 2)
-        w_det = (np.linalg.norm(pts4[1] - pts4[0]) + np.linalg.norm(pts4[2] - pts4[3])) / 2
-        h_det = (np.linalg.norm(pts4[3] - pts4[0]) + np.linalg.norm(pts4[2] - pts4[1])) / 2
-        if w_det < 1 or h_det < 1:
-            return None
-        ar_det = max(w_det, h_det) / min(w_det, h_det)
-        ar_mod = max(w, h) / max(min(w, h), 1)
-        tol = self._cfg.ar_tolerance
-        if ar_det < ar_mod / tol or ar_det > ar_mod * tol:
-            return None
+        return {"book_id": bid, "score": n_inliers, "bbox": bbox, "H": H,
+                "ncc": ncc}
 
-        area = cv2.contourArea(bbox)
-        scene_area = scene_shape[0] * scene_shape[1]
-        if area < self._cfg.min_area or area > scene_area * self._cfg.max_area_frac:
-            return None
-
-        return {"book_id": bid, "score": n_inliers, "bbox": bbox, "H": H}
-
-    def _strip(self, matches, tpl, kp_scene, H):
-        src = np.float32([tpl["kp"][m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-        dst = np.float32([kp_scene[m.queryIdx].pt for m in matches]).reshape(-1, 2)
-        proj = cv2.transform(src, H).reshape(-1, 2)
-        err = np.linalg.norm(proj - dst, axis=1)
-        return [m for m, e in zip(matches, err) if e >= self._cfg.ransac_thresh * 1.5]
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  NCC Warp-and-Compare Verifier
-# ══════════════════════════════════════════════════════════════════════════
-class NCCVerifier:
-    """Warps the model image into scene space using the estimated affine
-    transform and computes Normalised Cross-Correlation.
-
-    True positives have NCC ≈ 0.8, false positives ≈ 0.07.
-    A threshold of 0.20 removes 95 % of FPs while losing < 2 % of TPs.
-    """
-
-    def __init__(self, cfg: Config) -> None:
-        self._threshold = cfg.ncc_threshold
-        self._models: Dict[str, np.ndarray] = {}
-
-    def register(self, bid: str, enhanced: np.ndarray) -> None:
-        self._models[bid] = enhanced
-
-    def verify(self, det: dict, scene_enhanced: np.ndarray) -> Tuple[bool, float]:
-        """Return (accepted, ncc_score)."""
-        bid = det["book_id"]
+    # ── NCC warp-and-compare ─────────────────────────────────────────────
+    def _ncc(self, bid: str, H: np.ndarray, scene_enhanced: np.ndarray) -> float:
         model_img = self._models.get(bid)
         if model_img is None:
-            return True, 1.0
-        H = det["H"]
+            return 1.0
         h_s, w_s = scene_enhanced.shape[:2]
 
-        warp_fn = cv2.warpAffine if H.shape[0] == 2 else cv2.warpPerspective
-        warped = warp_fn(model_img, H, (w_s, h_s),
-                         flags=cv2.INTER_LINEAR,
-                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        mask = warp_fn(np.ones_like(model_img) * 255, H, (w_s, h_s),
-                       flags=cv2.INTER_NEAREST,
-                       borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        warped = cv2.warpAffine(model_img, H, (w_s, h_s),
+                                flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        mask = cv2.warpAffine(np.ones_like(model_img) * 255, H, (w_s, h_s),
+                              flags=cv2.INTER_NEAREST,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
         valid = mask > 128
         if valid.sum() < 100:
-            return True, 1.0
+            return 1.0
 
         w_pix = warped[valid].astype(np.float64)
         s_pix = scene_enhanced[valid].astype(np.float64)
@@ -500,9 +472,16 @@ class NCCVerifier:
         s_pix -= s_pix.mean()
         w_std, s_std = w_pix.std(), s_pix.std()
         if w_std < 1e-8 or s_std < 1e-8:
-            return False, 0.0
-        ncc = float(np.dot(w_pix, s_pix) / (w_std * s_std * len(w_pix)))
-        return ncc >= self._threshold, ncc
+            return 0.0
+        return float(np.dot(w_pix, s_pix) / (w_std * s_std * len(w_pix)))
+
+    # ── strip inliers for peeling ────────────────────────────────────────
+    def _strip(self, matches, tpl, kp_scene, H):
+        src = np.float32([tpl["kp"][m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        dst = np.float32([kp_scene[m.queryIdx].pt for m in matches]).reshape(-1, 2)
+        proj = cv2.transform(src, H).reshape(-1, 2)
+        err = np.linalg.norm(proj - dst, axis=1)
+        return [m for m, e in zip(matches, err) if e >= self._cfg.ransac_thresh * 1.5]
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -537,108 +516,19 @@ def nms(cands: List[dict], cfg: Config) -> List[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-#  Visualizer  — saves per-scene annotated images + summary grid
-# ══════════════════════════════════════════════════════════════════════════
-
-# Fixed palette — 22 visually distinct colours (one per model)
-MODEL_COLORS = {
-    "model_0":  (230,  25,  75),  "model_1":  ( 60, 180,  75),
-    "model_2":  (255, 225,  25),  "model_3":  (  0, 130, 200),
-    "model_4":  (245, 130,  48),  "model_5":  (145,  30, 180),
-    "model_6":  ( 70, 240, 240),  "model_7":  (240,  50, 230),
-    "model_8":  (210, 245,  60),  "model_9":  (250, 190, 212),
-    "model_10": (  0, 128, 128),  "model_11": (220, 190, 255),
-    "model_12": (170, 110,  40),  "model_13": (255, 250, 200),
-    "model_14": (128,   0,   0),  "model_15": (170, 255, 195),
-    "model_16": (128, 128,   0),  "model_17": (255, 215, 180),
-    "model_18": (  0,   0, 128),  "model_19": (128, 128, 128),
-    "model_20": ( 60,  20,  90),  "model_21": ( 10, 190, 100),
-}
-
-
-def _color_for(bid: str) -> Tuple[int, int, int]:
-    """Return a BGR colour for a book_id (persistent across scenes)."""
-    rgb = MODEL_COLORS.get(bid, (200, 200, 200))
-    return (rgb[2], rgb[1], rgb[0])          # RGB → BGR
-
-
-def draw_detections(
-    img: np.ndarray,
-    results: List[dict],
-    scene_name: str,
-    gt: List[str],
-    *,
-    ncc_scores: Optional[Dict[int, float]] = None,
-) -> np.ndarray:
-    """Draw bounding boxes + labels on a scene image.  Returns the annotated copy."""
-    vis = img.copy()
-
-    for i, r in enumerate(results):
-        bbox = np.int32(r["bbox"])
-        col = _color_for(r["book_id"])
-
-        # semi-transparent fill
-        overlay = vis.copy()
-        cv2.fillConvexPoly(overlay, bbox, col)
-        cv2.addWeighted(overlay, 0.18, vis, 0.82, 0, vis)
-
-        # border
-        cv2.polylines(vis, [bbox], True, col, 3, cv2.LINE_AA)
-
-        # label
-        ncc_str = ""
-        if ncc_scores and i in ncc_scores:
-            ncc_str = f"  NCC={ncc_scores[i]:.2f}"
-        label = f"{r['book_id']} ({r['score']}){ncc_str}"
-        fs, th = 0.50, 2
-        (tw, thr), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
-        pts = bbox.reshape(-1, 2)
-        x, y = pts[pts[:, 1].argmin()]
-        x = max(0, min(x, vis.shape[1] - tw))
-        y = max(thr + 12, y)
-        cv2.rectangle(vis, (x, y - thr - 8), (x + tw + 4, y + 2), col, -1)
-        cv2.putText(vis, label, (x + 2, y - 3),
-                    cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th, cv2.LINE_AA)
-
-    # header bar with GT comparison
-    detected = [r["book_id"] for r in results]
-    gt_rem = list(gt)
-    tp = 0
-    for d in detected:
-        if d in gt_rem:
-            tp += 1
-            gt_rem.remove(d)
-    fp = len(detected) - tp
-    fn = len(gt) - tp
-    status = "PERFECT" if fp == 0 and fn == 0 else f"TP={tp} FP={fp} FN={fn}"
-
-    header_h = 36
-    header = np.zeros((header_h, vis.shape[1], 3), dtype=np.uint8)
-    header[:] = (40, 40, 40)
-    text = f"{scene_name}  |  Det={len(results)}  GT={len(gt)}  |  {status}"
-    bar_col = (0, 200, 0) if (fp == 0 and fn == 0) else (0, 140, 255)
-    cv2.rectangle(header, (0, 0), (vis.shape[1], header_h), bar_col, 3)
-    cv2.putText(header, text, (8, 25),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-    vis = np.vstack([header, vis])
-    return vis
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Book Recognizer  (orchestrator)
+#  Book Recognizer  (pure detection pipeline — no GT, no visualisation)
 # ══════════════════════════════════════════════════════════════════════════
 class BookRecognizer:
-    """Wires all pipeline stages together."""
+    """Wires all pipeline stages together.  Returns raw detection dicts;
+    all visualisation and evaluation is handled externally."""
 
     def __init__(self, cfg: Optional[Config] = None) -> None:
         self.cfg = cfg or Config()
         self.prep      = Preprocessor(self.cfg)
         self.extractor = FeatureExtractor(self.cfg)
         self.matcher   = FeatureMatcher(self.cfg)
-        self.voter     = StarVoter()
-        self.clusterer = Clusterer(self.cfg)
-        self.verifier  = GeometricVerifier(self.cfg)
-        self.ncc_vfy   = NCCVerifier(self.cfg) # Always init, check config in Verify
+        self.voter     = StarVoter(self.cfg)
+        self.verifier  = Verifier(self.cfg)
 
     # ── model indexing ───────────────────────────────────────────────────
     def load_library(self, path: Path) -> None:
@@ -657,8 +547,7 @@ class BookRecognizer:
                 continue
             self.voter.register(bid, kp, enhanced.shape)
             self.matcher.add(bid, des)
-            if self.cfg.ncc_verify:
-                self.ncc_vfy.register(bid, clean)
+            self.verifier.register(bid, clean)
             n += 1
             print(f"  {bid}: {len(kp):5d} keypoints")
         self.matcher.build()
@@ -669,8 +558,7 @@ class BookRecognizer:
         self,
         kp_scene: List[cv2.KeyPoint],
         des_scene: Optional[np.ndarray],
-        scene_shape: Tuple[int, ...],
-        # scene_clean: Optional[np.ndarray] = None, # (No longer used inside detect)
+        scene_enhanced: np.ndarray,
     ) -> List[dict]:
         if des_scene is None:
             return []
@@ -680,19 +568,17 @@ class BookRecognizer:
             tpl = self.voter.templates[bid]
             if len(matches) < self.cfg.dbscan_min_pts:
                 continue
-            centres = self.voter.project(matches, kp_scene, tpl)
-            clusters = self.clusterer(centres)
+            clusters = self.voter.vote(matches, kp_scene, tpl)
             for idxs in clusters.values():
                 if len(idxs) < self.cfg.min_inliers:
                     continue
                 cluster_matches = [matches[i] for i in idxs]
-                cands.extend(self.verifier.peel(bid, cluster_matches, tpl, kp_scene, scene_shape))
+                cands.extend(self.verifier.peel(bid, cluster_matches, tpl, kp_scene, scene_enhanced))
         return nms(cands, self.cfg)
 
-    # ── full run with visualisation ──────────────────────────────────────
-    def run(self, scenes_path: Path, output_path: Path) -> Dict[str, List[dict]]:
-        output_path.mkdir(parents=True, exist_ok=True)
-
+    # ── batch run (detection only) ────────────────────────────────────────
+    def run(self, scenes_path: Path) -> Dict[str, List[dict]]:
+        """Run detection on all scenes.  Returns {filename: [detections]}."""
         files = sorted(
             f for f in os.listdir(scenes_path)
             if f.lower().endswith((".png", ".jpg", ".jpeg"))
@@ -700,159 +586,190 @@ class BookRecognizer:
         print(f"Processing {len(files)} scenes ...\n")
 
         all_results: Dict[str, List[dict]] = {}
-        annotated_images: List[np.ndarray] = []
-        total = 0
-
         for f in files:
-            scene_name = os.path.splitext(f)[0]
             img = cv2.imread(str(scenes_path / f))
             if img is None:
                 continue
-
             enhanced, clean = self.prep(img)
             kp, des = self.extractor(enhanced)
-            results = self.detect(kp, des, enhanced.shape)
-
-            # ── post-verification (NCC warp-and-compare) ────────────────
-            ncc_scores: Dict[int, float] = {}
-            if self.cfg.ncc_verify:
-                kept = []
-                for i, r in enumerate(results):
-                    ok, score = self.ncc_vfy.verify(r, clean)
-                    if ok:
-                        ncc_scores[len(kept)] = score
-                        kept.append(r)
-                results = kept
-
+            results = self.detect(kp, des, clean)
             all_results[f] = results
-            total += len(results)
-
-            # ── draw & save ──────────────────────────────────────────────
-            gt = GROUND_TRUTH.get(scene_name, [])
-            vis = draw_detections(img, results, scene_name, gt, ncc_scores=ncc_scores)
-            out_file = output_path / f"{scene_name}_result.jpg"
-            cv2.imwrite(str(out_file), vis)
-            annotated_images.append((scene_name, vis))
 
             det_ids = [r["book_id"] for r in results]
-            mark = "OK" if self._check_scene(det_ids, gt) else "!!"
-            print(f"  [{mark}] {scene_name}: detected {len(results)} → {det_ids}")
+            print(f"  {os.path.splitext(f)[0]}: {len(results)} detections → {det_ids}")
 
-        print(f"\nTotal: {total} books detected across {len(files)} scenes")
-        print(f"Annotated images saved to {output_path}/\n")
-
-        # ── summary grid ─────────────────────────────────────────────────
-        self._save_summary_grid(annotated_images, output_path)
+        print(f"\nTotal: {sum(len(r) for r in all_results.values())} books "
+              f"detected across {len(all_results)} scenes\n")
         return all_results
 
-    # ── helpers ──────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Evaluator  (GT-aware metrics — fully independent of pipeline)
+# ══════════════════════════════════════════════════════════════════════════
+class Evaluator:
+    """Compares detection results against a ground-truth dictionary."""
+
+    def __init__(self, ground_truth: Dict[str, List[str]]) -> None:
+        self._gt = ground_truth
+
     @staticmethod
-    def _check_scene(detected: List[str], gt: List[str]) -> bool:
+    def _score_scene(detected: List[str], gt: List[str]) -> Tuple[int, int, int]:
         gt_rem = list(gt)
         tp = 0
         for d in detected:
             if d in gt_rem:
                 tp += 1
                 gt_rem.remove(d)
-        return (len(detected) - tp) == 0 and (len(gt) - tp) == 0
+        return tp, len(detected) - tp, len(gt) - tp
 
-    @staticmethod
-    def _save_summary_grid(images: list, output_path: Path) -> None:
-        """Save a large grid image with all annotated scenes."""
-        if not images:
+    def evaluate(self, all_results: Dict[str, List[dict]]) -> Dict[str, float]:
+        """Print per-scene breakdown and return {precision, recall, f1}."""
+        total_tp = total_fp = total_fn = 0
+        print(f"\n{'='*70}")
+        print("  EVALUATION vs GROUND TRUTH")
+        print(f"{'='*70}")
+
+        for fname in sorted(all_results):
+            scene_key = os.path.splitext(fname)[0]
+            gt = self._gt.get(scene_key, [])
+            detected = [r["book_id"] for r in all_results[fname]]
+            tp, fp, fn = self._score_scene(detected, gt)
+            total_tp += tp; total_fp += fp; total_fn += fn
+
+            if gt or detected:
+                mark = "  OK " if fp == 0 and fn == 0 else "  !! "
+                print(f"{mark} {scene_key}: GT={len(gt)}, Det={len(detected)}, "
+                      f"TP={tp}, FP={fp}, FN={fn}")
+                if fp > 0 or fn > 0:
+                    print(f"       GT:  {gt}")
+                    print(f"       Det: {detected}")
+
+        prec = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else 0
+        rec  = total_tp / (total_tp + total_fn) if (total_tp + total_fn) else 0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) else 0
+
+        print(f"\n{'─'*70}")
+        print(f"  TP={total_tp}  FP={total_fp}  FN={total_fn}")
+        print(f"  Precision : {prec:.3f}")
+        print(f"  Recall    : {rec:.3f}")
+        print(f"  F1 Score  : {f1:.3f}")
+        print(f"{'='*70}\n")
+        return {"precision": prec, "recall": rec, "f1": f1}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  Visualizer  (matplotlib display — fully independent of pipeline)
+# ══════════════════════════════════════════════════════════════════════════
+class Visualizer:
+    """Draws detection bounding boxes and displays results via matplotlib.
+    No files are saved — designed for notebook usage."""
+
+    def __init__(self, ground_truth: Optional[Dict[str, List[str]]] = None) -> None:
+        self._gt = ground_truth or {}
+
+    # ── plot a single scene ──────────────────────────────────────────────
+    def show_scene(self, img: np.ndarray, results: List[dict],
+                   scene_name: str) -> None:
+        """Annotate and display a single scene."""
+        vis = self._draw(img, results, scene_name)
+        plt.figure(figsize=(12, 8))
+        plt.imshow(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB))
+        plt.title(scene_name, fontsize=13, fontweight="bold")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+    # ── plot the summary grid ────────────────────────────────────────────
+    def show_grid(self, all_results: Dict[str, List[dict]],
+                  scenes_path: Path, *, cols: int = 5) -> None:
+        """Build and display a summary grid of all annotated scenes."""
+        thumbs: List[np.ndarray] = []
+        tw, th = 640, 400
+        for fname in sorted(all_results):
+            scene_name = os.path.splitext(fname)[0]
+            img = cv2.imread(str(scenes_path / fname))
+            if img is None:
+                continue
+            vis = self._draw(img, all_results[fname], scene_name)
+            thumbs.append(cv2.resize(vis, (tw, th), interpolation=cv2.INTER_AREA))
+        if not thumbs:
             return
-        # Determine grid size
-        n = len(images)
-        cols = min(5, n)
+        n = len(thumbs)
         rows = (n + cols - 1) // cols
-
-        # Resize all to a common thumbnail size
-        thumb_w, thumb_h = 640, 400
-        thumbs = []
-        for name, img in images:
-            resized = cv2.resize(img, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
-            thumbs.append(resized)
-
-        # Pad with black thumbnails if needed
         while len(thumbs) < rows * cols:
-            thumbs.append(np.zeros((thumb_h, thumb_w, 3), dtype=np.uint8))
+            thumbs.append(np.zeros((th, tw, 3), dtype=np.uint8))
+        grid = np.vstack([
+            np.hstack(thumbs[r * cols:(r + 1) * cols]) for r in range(rows)
+        ])
+        plt.figure(figsize=(22, 14))
+        plt.imshow(cv2.cvtColor(grid, cv2.COLOR_BGR2RGB))
+        plt.title("Book Recognition — All Scenes", fontsize=14, fontweight="bold")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
 
-        # Assemble grid
-        grid_rows = []
-        for r in range(rows):
-            row_imgs = thumbs[r * cols: (r + 1) * cols]
-            grid_rows.append(np.hstack(row_imgs))
-        grid = np.vstack(grid_rows)
+    # ── private helpers ──────────────────────────────────────────────────
+    def _draw(self, img: np.ndarray, results: List[dict],
+              scene_name: str) -> np.ndarray:
+        """Annotate a scene image with bounding boxes and a header bar."""
+        vis = img.copy()
+        for r in results:
+            bbox = np.int32(r["bbox"])
+            col = self._bgr(r["book_id"])
+            overlay = vis.copy()
+            cv2.fillConvexPoly(overlay, bbox, col)
+            cv2.addWeighted(overlay, 0.18, vis, 0.82, 0, vis)
+            cv2.polylines(vis, [bbox], True, col, 3, cv2.LINE_AA)
 
-        cv2.imwrite(str(output_path / "summary_grid.jpg"), grid)
-        print(f"Summary grid saved to {output_path / 'summary_grid.jpg'}")
+            ncc_str = f"  NCC={r['ncc']:.2f}" if "ncc" in r else ""
+            label = f"{r['book_id']} ({r['score']}){ncc_str}"
+            fs, thickness = 0.50, 2
+            (tw, thr), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, fs, thickness)
+            pts = bbox.reshape(-1, 2)
+            x, y = pts[pts[:, 1].argmin()]
+            x = max(0, min(x, vis.shape[1] - tw))
+            y = max(thr + 12, y)
+            cv2.rectangle(vis, (x, y - thr - 8), (x + tw + 4, y + 2), col, -1)
+            cv2.putText(vis, label, (x + 2, y - 3),
+                        cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), thickness, cv2.LINE_AA)
 
+        return self._add_header(vis, results, scene_name)
 
-# ══════════════════════════════════════════════════════════════════════════
-#  Evaluation
-# ══════════════════════════════════════════════════════════════════════════
-def evaluate(all_results: Dict[str, List[dict]]) -> Dict[str, float]:
-    """Compute precision / recall / F1 against ground truth."""
-    total_tp = total_fp = total_fn = 0
-    print(f"\n{'='*70}")
-    print("  EVALUATION vs GROUND TRUTH")
-    print(f"{'='*70}")
+    @staticmethod
+    def _bgr(bid: str) -> Tuple[int, int, int]:
+        """Deterministic random BGR colour from model id (consistent across scenes)."""
+        h = hash(bid)
+        r = (h & 0xFF) % 200 + 55
+        g = ((h >> 8) & 0xFF) % 200 + 55
+        b = ((h >> 16) & 0xFF) % 200 + 55
+        return (b, g, r)
 
-    for fname, results in sorted(all_results.items()):
-        scene_key = os.path.splitext(fname)[0]
-        gt = GROUND_TRUTH.get(scene_key, [])
-        detected = [r["book_id"] for r in results]
+    def _add_header(self, vis: np.ndarray, results: List[dict],
+                    scene_name: str) -> np.ndarray:
+        header_h = 36
+        header = np.zeros((header_h, vis.shape[1], 3), dtype=np.uint8)
+        header[:] = (40, 40, 40)
 
-        gt_rem = list(gt)
-        tp = 0
-        for d in detected:
-            if d in gt_rem:
-                tp += 1
-                gt_rem.remove(d)
-        fp = len(detected) - tp
-        fn = len(gt) - tp
-        total_tp += tp
-        total_fp += fp
-        total_fn += fn
+        gt = self._gt.get(scene_name)
+        if gt is not None:
+            detected = [r["book_id"] for r in results]
+            gt_rem = list(gt); tp = 0
+            for d in detected:
+                if d in gt_rem:
+                    tp += 1; gt_rem.remove(d)
+            fp, fn = len(detected) - tp, len(gt) - tp
+            ok = fp == 0 and fn == 0
+            status = "PERFECT" if ok else f"TP={tp} FP={fp} FN={fn}"
+            text = f"{scene_name}  |  Det={len(results)}  GT={len(gt)}  |  {status}"
+            bar_col = (0, 200, 0) if ok else (0, 140, 255)
+        else:
+            text = f"{scene_name}  |  Det={len(results)}"
+            bar_col = (140, 140, 140)
 
-        if gt or detected:
-            s = "  OK " if fp == 0 and fn == 0 else "  !! "
-            print(f"{s} {scene_key}: GT={len(gt)}, Det={len(detected)}, TP={tp}, FP={fp}, FN={fn}")
-            if fp > 0 or fn > 0:
-                print(f"       GT:  {gt}")
-                print(f"       Det: {detected}")
-
-    prec = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else 0
-    rec  = total_tp / (total_tp + total_fn) if (total_tp + total_fn) else 0
-    f1   = 2 * prec * rec / (prec + rec) if (prec + rec) else 0
-
-    print(f"\n{'─'*70}")
-    print(f"  TP={total_tp}  FP={total_fp}  FN={total_fn}")
-    print(f"  Precision : {prec:.3f}")
-    print(f"  Recall    : {rec:.3f}")
-    print(f"  F1 Score  : {f1:.3f}")
-    print(f"{'='*70}\n")
-    return {"precision": prec, "recall": rec, "f1": f1}
-
-
-# ══════════════════════════════════════════════════════════════════════════
-#  Display summary in matplotlib
-# ══════════════════════════════════════════════════════════════════════════
-def show_summary(output_path: Path) -> None:
-    """Open the saved summary grid with matplotlib."""
-    grid_file = output_path / "summary_grid.jpg"
-    if not grid_file.exists():
-        print("No summary grid found.")
-        return
-    grid = cv2.imread(str(grid_file))
-    plt.figure(figsize=(22, 14))
-    plt.imshow(cv2.cvtColor(grid, cv2.COLOR_BGR2RGB))
-    plt.title("Book Recognition — All Scenes", fontsize=14, fontweight="bold")
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(str(output_path / "summary_grid_figure.png"), dpi=150, bbox_inches="tight")
-    print(f"Figure saved to {output_path / 'summary_grid_figure.png'}")
-    plt.show()
+        cv2.rectangle(header, (0, 0), (vis.shape[1], header_h), bar_col, 3)
+        cv2.putText(header, text, (8, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        return np.vstack([header, vis])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -860,11 +777,17 @@ def show_summary(output_path: Path) -> None:
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     cfg = Config()
+
+    # 1. Detection (GT-unaware)
     rec = BookRecognizer(cfg)
     rec.load_library(MODELS_DIR)
+    all_results = rec.run(SCENES_DIR)
 
-    all_results = rec.run(SCENES_DIR, OUTPUT_DIR)
-    metrics = evaluate(all_results)
+    # 2. Evaluation (optional, GT-aware)
+    evaluator = Evaluator(GROUND_TRUTH)
+    evaluator.evaluate(all_results)
 
-    # show interactive summary
-    show_summary(OUTPUT_DIR)
+    # 3. Visualisation (optional)
+    vis = Visualizer(GROUND_TRUTH)
+    vis.show_grid(all_results, SCENES_DIR)
+
